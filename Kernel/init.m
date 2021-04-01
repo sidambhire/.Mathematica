@@ -24,3 +24,5 @@ RowBox[{"Indexed", "[",
 RowBox[{"x_", ",", 
 RowBox[{"{", 
 RowBox[{"i_", ",", "j_", ",", "k_"}], "}"}]}], "]"}]]]
+
+Alert[]:=EmitSound[Sound[SoundNote[]]]
