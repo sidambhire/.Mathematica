@@ -1,4 +1,5 @@
 (** User Mathematica initialization file **)
+Notation`AutoLoadNotationPalette = False
 Needs["Notation`"]
 
 Notation[ParsedBoxWrapper[SubscriptBox["t_", "i_"]] \[DoubleLongLeftRightArrow] 
@@ -6,6 +7,4 @@ Notation[ParsedBoxWrapper[SubscriptBox["t_", "i_"]] \[DoubleLongLeftRightArrow]
       RowBox[{"t_", ",", RowBox[{"List", "[", "i_", "]"}]}], 
       "]"}]]]
 
-(** Add Notations, if any, before this line **)
-Notation`AutoLoadNotationPalette = True
 Alert[]:=EmitSound[Sound[SoundNote[]]]
