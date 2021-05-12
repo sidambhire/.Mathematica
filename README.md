@@ -4,8 +4,10 @@ My custom mathematica config. This will be used in other Mathematica files in al
 ## Functions used:
 ### Subscript as Indexed
 Code summary:
+
 ![Code](CodeExample.png "Example Code")
 Usage:
+
 ![Example Usage](Example.png "Example Usage")
 
 ### Alert using sound after something is done
