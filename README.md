@@ -6,6 +6,7 @@ My custom mathematica config. This will be used in other Mathematica files in al
 Code summary:
 
 ![Code](CodeExample.png "Example Code")
+
 Usage:
 
 ![Example Usage](Example.png "Example Usage")
