@@ -18,6 +18,3 @@ Usage:
 ```
 LongCalculation[Expr];Alert[]
 ```
-
-## Remote login
-See [Stack Exchange Answer](https://mathematica.stackexchange.com/questions/28274/remote-kernel-error-mleconnect).
