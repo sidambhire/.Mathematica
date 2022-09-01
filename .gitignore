@@ -1,7 +1,10 @@
 ApplicationData
 Applications
 Autoload
-FrontEnd
+FrontEnd/Logs
+FrontEnd/13*
+FrontEnd/init.m
+FrontEnd/*.log
 Knowledgebase
 Licensing
 Paclets
