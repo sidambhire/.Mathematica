@@ -6,8 +6,12 @@ BeginPackage["LargeHomSolve`"];
 (* ------------- PUBLIC (exported) symbols: add BOTH usage messages ------------- *)
 
 SolveLargeHomogeneousLinearSystem::usage =
-  "SolveLargeHomogeneousLinearSystem[eqns, vars, opts] solves large sparse homogeneous linear systems with symbolic parameters.";
-
+  "SolveLargeHomogeneousLinearSystem[eqs, vars, opts] returns a basis or rules for the solution x such that A.x == 0. \
+Options:\n" <>
+  "\"Parameters\" -> {}, \"Assumptions\" -> True, \"ParameterSampling\" -> 5, \"SampleSubstitution\" -> Automatic,\n" <>
+  "\"DeduplicateRows\" -> True, \"DropZeroRows\" -> True, \"BlockDecomposition\" -> False,\n" <>
+  "\"Parallel\" -> True, \"MaxKernels\" -> Automatic, \"Debug\" -> False,\n" <>
+  "\"Return\" -> \"Basis\"|\"Association\"|\"Rules\", \"FreeParameterSymbol\" -> \[FormalT].";
 SafeCoefficientRules::usage =
   "SafeCoefficientRules[expr, vars, opts] returns rules {expVector->coeff,...} for additive terms in expr w.r.t. vars. \
 Options: \"Assumptions\" (default True), \"TimeConstraint\" (default 2), \
@@ -17,153 +21,196 @@ SafeCoefficientRulesFast::usage =
   "SafeCoefficientRules[expr, vars] returns rules {expVector->coeff,...} for additive terms in expr w.r.t. vars.";
 
 
-Options[SolveLargeHomogeneousLinearSystem] = {
-  "Parameters"      -> {},
-  "Assumptions"     -> True,
-  "GenericSolve"    -> True,
-  "TimeConstraint"  -> 2,          (* seconds or Automatic *)
-  "DeduplicateRows" -> False,
-  "ParameterHead"   -> Automatic   (* default parameter head symbol (e.g., t); resolved at runtime *)
-};
-
 Begin["`Private`"];
 
 (* ------------- PRIVATE: put your implementations here ------------- *)
 
 
-(* (Re)define safely on reload without wiping Options *)
-Unprotect[SolveLargeHomogeneousLinearSystem];
-DownValues[SolveLargeHomogeneousLinearSystem] =.;
-SubValues[SolveLargeHomogeneousLinearSystem] =.;
-UpValues[SolveLargeHomogeneousLinearSystem]  =.;
 
-SolveLargeHomogeneousLinearSystem[eqns_List, vars_List, opts:OptionsPattern[]] := Module[
+SetAttributes[debugPrint, HoldAll];
+debugPrint[flag_, args__] := If[TrueQ[flag], Print[Style[Row[{DateString[{"Time"}], " | ", args}], {Small, GrayLevel[0.25]}]]];
+
+normalizeEquations[eqs_List] := DeleteCases[Flatten@List@Replace[eqs, {
+    Equal[l_, r_] :> (l - r),
+    True -> 0
+  }, {0, 1}], 0];
+
+Options[buildSparseMatrix] = {"Debug" -> False};
+buildSparseMatrix[eqsIn_List, vars_List, OptionsPattern[]] := Module[
+  {dbg = OptionValue["Debug"], eqs = normalizeEquations[eqsIn], carr, b, A, dims, nz},
+  debugPrint[dbg, "Building sparse matrix..."];
+  carr = Quiet@Check[CoefficientArrays[eqs, vars], $Failed];
+  If[carr === $Failed,
+    debugPrint[dbg, "CoefficientArrays failed. Falling back to direct coefficient extraction."];
+    A = SparseArray[Table[Coefficient[eqs[[i]], vars[[j]]], {i, Length@eqs}, {j, Length@vars}]];
+    b = ConstantArray[0, Length@eqs];,
+    b = Normal@First@carr;
+    A = SparseArray@Last@carr;
+  ];
+  dims = Dimensions[A];
+  nz = With[{p = A["NonzeroPositions"]}, If[ListQ[p], Length@p, 0]];
+  debugPrint[dbg, "Matrix dimensions: ", dims, ", Nonzeros: ", nz];
+  <|"Matrix" -> A, "Constant" -> b|>
+]
+
+Options[dropZeroRowsSparse] = {"Debug" -> False};
+dropZeroRowsSparse[A_SparseArray, OptionsPattern[]] := Module[
+  {dbg = OptionValue["Debug"], nnzByRow, keep, A2},
+  nnzByRow = Total[Unitize@Normal@A, {2}];
+  keep = Flatten@Position[nnzByRow, _?(# > 0 & )];
+  A2 = If[Length@keep < Length@nnzByRow && Length@keep > 0, A[[keep, All]], A];
+  debugPrint[dbg, "Dropped zero rows: ", Max[0, Length@nnzByRow - Length@keep], " removed; ", If[Length@keep>0, Length@keep, Length@nnzByRow], " kept."];
+  {A2, keep}
+]
+
+Options[deduplicateRowsSparse] = {"Debug" -> False, "Substitution" -> Automatic};
+deduplicateRowsSparse[A_SparseArray, OptionsPattern[]] := Module[
+  {dbg = OptionValue["Debug"], sub = OptionValue["Substitution"], Aeval, keys, groups, idx},
+  debugPrint[dbg, "Deduplicating rows by numeric probe..."];
+  Aeval = If[sub === Automatic || sub === {},
+    N@Normal@A,
+    N@Normal@(A /. sub)
+  ];
+  keys = Hash /@ Aeval;
+  groups = GroupBy[Range[Length@keys], keys[[#]] &];
+  idx = First /@ Values[groups];
+  debugPrint[dbg, "Dedup kept ", Length@idx, " of ", Length@keys, " rows."];
+  {A[[idx, All]], idx}
+]
+
+defaultSampleGenerator[params_List, k_Integer?Positive] := Module[{vals},
+  If[params === {}, Table[<||>, {k}], (vals = RandomChoice[DeleteCases[Range[-97,97],0], {k, Length@params}];
+    Table[Thread[params -> vals[[i]]], {i,k}])]
+]
+
+Options[intersectNullSpacesIter] = {"Debug" -> False};
+intersectNullSpacesIter[A_SparseArray, samples_List, OptionsPattern[]] := Module[
+  {dbg = OptionValue["Debug"], n, Bmat, As, k = 1},
+  n = Last@Dimensions@A;
+  If[Length@samples == 0, Return[SparseArray[{}, {n, 0}]]];
+  As = Normal@(A /. First@samples);
+  Bmat = Transpose@NullSpace[As]; (* n x d1 *)
+  debugPrint[dbg, "Nullity(sample 1): ", If[MatrixQ[Bmat], Last@Dimensions@Bmat, 0]];
+  Do[
+    If[!MatrixQ[Bmat] || Last@Dimensions@Bmat == 0, Break[]];
+    k++; As = Normal@(A /. s);
+    Bmat = With[{AsB = As . Bmat}, Bmat . Transpose@NullSpace[AsB]];
+    debugPrint[dbg, "Nullity(sample ", k, "): ", If[MatrixQ[Bmat], Last@Dimensions@Bmat, 0]];
+  , {s, Rest@samples}];
+  If[!MatrixQ[Bmat], SparseArray[{}, {n, 0}], Bmat]
+]
+
+Options[variableBlocksFromMatrix] = {"Debug" -> False};
+variableBlocksFromMatrix[A_SparseArray, OptionsPattern[]] := Module[
+  {dbg = OptionValue["Debug"], pos, n, byRow, edges, g, comps},
+  n = Last@Dimensions@A;
+  pos = A["NonzeroPositions"];
+  byRow = GatherBy[pos, First];
+  edges = Flatten[Subsets[Last /@ #, {2}] & /@ byRow, 1];
+  g = Graph[Range[n], UndirectedEdge @@@ (Sort /@ edges)];
+  comps = ConnectedComponents[g];
+  debugPrint[dbg, "Detected ", Length@comps, " variable blocks."];
+  comps /; True
+]
+
+Options[solveNullspacePerBlock] = {"Debug" -> False, "Samples" -> {}, 
+   "Parallel" -> True, "MaxKernels" -> Automatic};
+   
+solveNullspacePerBlock[A_SparseArray, blocks_List, OptionsPattern[]] :=
+   Module[{dbg = OptionValue["Debug"], samples = OptionValue["Samples"],
+     par = TrueQ@OptionValue["Parallel"], 
+    maxk = OptionValue["MaxKernels"], n = Last@Dimensions@A, pos, 
+    blockMats = {}, rowsForBlk, Ablk, Bblk, lift}, 
+   pos = A["NonzeroPositions"];
+   If[par && $KernelCount == 0, Quiet@LaunchKernels[]];
+   Do[rowsForBlk = 
+     Union@(First /@ Select[pos, MemberQ[blocks[[bi]], Last@#] &]);
+    (*Unconstrained block=>full nullspace=identity on that block*)
+    If[rowsForBlk === {} || Length@rowsForBlk == 0, 
+     Bblk = IdentityMatrix[Length@blocks[[bi]]], 
+     Ablk = A[[rowsForBlk, blocks[[bi]]]];
+     Bblk = 
+      If[samples === {}, Transpose@NullSpace@Normal@Ablk, 
+       Transpose@
+        LargeHomSolve`Private`intersectNullSpacesIter[
+         A[[All, blocks[[bi]]]], samples, "Debug" -> dbg, 
+         "Parallel" -> False]];
+     If[! MatrixQ[Bblk], 
+      Bblk = ConstantArray[{}, {Length@blocks[[bi]], 0}]];];
+    (*Lift block basis (size:n\[Times]dim_blk) and collect*)
+    lift = SparseArray[
+      Thread[Transpose[{Range[Length@blocks[[bi]]], blocks[[bi]]}] -> 
+        1], {Length@blocks[[bi]], n}];
+    AppendTo[blockMats, Transpose[lift] . Bblk], {bi, Length@blocks}];
+   If[blockMats === {}, SparseArray[{}, {n, 0}], 
+    Fold[If[#1 === {}, #2, Join[#1, #2, 2]] &, {}, 
+     blockMats]  (*column-wise concat*)]];
+     
+Options[SolveLargeHomogeneousLinearSystem] = {
+  "Parameters" -> {},
+  "Assumptions" -> True,
+  "ParameterSampling" -> 5,
+  "SampleSubstitution" -> Automatic,
+  "DeduplicateRows" -> True,
+  "DropZeroRows" -> True,
+  "BlockDecomposition" -> False,
+  "Parallel" -> True,
+  "MaxKernels" -> Automatic,
+  "Debug" -> False,
+  "Return" -> "Basis",
+  "FreeParameterSymbol" -> \[FormalT]
+};
+
+SolveLargeHomogeneousLinearSystem[eqsIn_List, vars_List, opts : OptionsPattern[]] := Module[
   {
-    (* options *)
-    params   = OptionValue["Parameters"],
-    asm0     = OptionValue["Assumptions"],
-    genericQ = TrueQ @ OptionValue["GenericSolve"],
-    tcon     = OptionValue["TimeConstraint"],
-    dedupQ   = TrueQ @ OptionValue["DeduplicateRows"],
-    phead    = OptionValue["ParameterHead"],
-
-    (* locals *)
-    headSym, asm, toZero, buildA, nullBasisRules, built, A2, Nul, rules, denoms, badSet
+    dbg = OptionValue["Debug"],
+    params = OptionValue["Parameters"],
+    nsamp = OptionValue["ParameterSampling"],
+    sampleFn = OptionValue["SampleSubstitution"],
+    dedup = TrueQ@OptionValue["DeduplicateRows"],
+    drop0 = TrueQ@OptionValue["DropZeroRows"],
+    blockDecomp = TrueQ@OptionValue["BlockDecomposition"],
+    par = TrueQ@OptionValue["Parallel"],
+    maxk = OptionValue["MaxKernels"],
+    ret = OptionValue["Return"],
+    freeSym = OptionValue["FreeParameterSymbol"],
+    Arec, A, rowsKept, rowsDedupIdx, blocks, samples, subsForDedup,
+    basisMat, dim, nz, rhsVec
   },
-
-  (* Resolve parameter head ONCE to a plain symbol *)
-  headSym = Replace[phead, {
-    Automatic  :> Symbol["t"],           (* default uses Global`t to avoid context shadowing *)
-    s_Symbol   :> s,
-    str_String :> With[{tmp = ToExpression[str]}, If[SymbolQ[tmp], tmp, Symbol["t"]]],
-    _          :> Symbol["t"]
-  }];
-  If[!SymbolQ[headSym], headSym = Symbol["t"]];
-
-  (* Treat parameters as nonzero for generic pivoting, if requested *)
-  asm = If[genericQ && params =!= {}, asm0 && And @@ Thread[params != 0], asm0];
-
-  (* Helper: normalize each equation to LHS-RHS and simplify *)
-  toZero = Function[{e},
-    Simplify[
-      Expand @ If[MatchQ[e, _Equal], First[e] - Last[e], e],
-      asm, TimeConstraint -> tcon
-    ]
+  debugPrint[dbg, "======== SolveLargeHomogeneousLinearSystem START ========"];
+  debugPrint[dbg, "Equations: ", Length@Flatten@eqsIn, " | Variables: ", Length@vars];
+  Arec = buildSparseMatrix[eqsIn, vars, "Debug" -> dbg];
+  A = Arec["Matrix"];
+  If[drop0, {A, rowsKept} = dropZeroRowsSparse[A, "Debug" -> dbg]];
+  If[dedup, subsForDedup = Automatic; {A, rowsDedupIdx} = deduplicateRowsSparse[A, "Debug" -> dbg, "Substitution" -> subsForDedup]];
+  samples = Which[
+    nsamp <= 0, {},
+    sampleFn === Automatic, defaultSampleGenerator[params, nsamp],
+    Head[sampleFn] === Function, Table[sampleFn[params], {nsamp}],
+    MatchQ[sampleFn, {_Rule ..}] || MatchQ[sampleFn, {(_Rule) ..}], ConstantArray[sampleFn, nsamp],
+    True, defaultSampleGenerator[params, nsamp]
   ];
-
-  (* Helper: build full (#rows \[Times] #vars) coefficient matrix; never drop columns *)
-  buildA = Function[{eqs},
-    Module[{eq0, paramOnly, paramConstraints, varEqns, rowCoeffs, mat, dropped = 0, nvars, A},
-      eq0 = toZero /@ eqs;
-
-      paramOnly        = Select[eq0, FreeQ[#, Alternatives @@ vars] &];
-      paramConstraints = Complement[paramOnly, Select[paramOnly, PossibleZeroQ]];
-      varEqns          = Complement[eq0, paramOnly];
-
-      If[varEqns === {},
-        Return @ <|"A"->SparseArray[{}, {0, Length[vars]}], "Dropped"->0,
-                  "ParamConstraints"->(Equal[#,0]&/@paramConstraints),
-                  "Rows"->0, "Cols"->Length[vars]|>
-      ];
-
-      rowCoeffs[e_] := Simplify[Coefficient[e, #] & /@ vars, asm, TimeConstraint -> tcon];
-      mat = rowCoeffs /@ varEqns;                 (* (#eqns) \[Times] (#vars) *)
-
-      If[dedupQ, With[{m0 = Length[mat]}, mat = DeleteDuplicates[mat]; dropped = m0 - Length[mat]]];
-
-      nvars = Length[vars];
-      If[mat === {}, A = SparseArray[{}, {0, nvars}], If[VectorQ[mat], mat = {mat}]; A = SparseArray[mat]];
-
-      <|"A"->A, "Dropped"->dropped,
-        "ParamConstraints"->(Equal[#,0]&/@paramConstraints),
-        "Rows"->If[mat==={},0,Length[mat]], "Cols"->nvars|>
-    ]
-  ];
-
-  (* Helper: turn nullspace basis into rules vars -> (B . t) *)
-  nullBasisRules = Function[{basisIn},
-    Module[{n = Length[vars], mat, dims, B, k, tsyms, sol},
-      mat = basisIn /. s_SparseArray :> Normal[s];
-
-      Which[
-        VectorQ[mat],
-          If[Length[mat] =!= n, Return @ Thread[vars -> ConstantArray[0, n]]];
-          B = Transpose @ {mat},                             (* n\[Times]1 *)
-        ListQ[mat] && AllTrue[mat, VectorQ[#] &],
-          If[Length[First@mat] =!= n, Return @ Thread[vars -> ConstantArray[0, n]]];
-          B = Transpose @ mat,                               (* rows=basis -> n\[Times]k *)
-        MatrixQ[mat],
-          dims = Dimensions[mat];
-          B = Which[
-                dims[[1]] == n, mat,                         (* n\[Times]k *)
-                dims[[2]] == n, Transpose @ mat,             (* k\[Times]n -> n\[Times]k *)
-                True, Return @ Thread[vars -> ConstantArray[0, n]]
-              ],
-        True,
-          Return @ Thread[vars -> ConstantArray[0, n]]
-      ];
-
-      k = Last @ Dimensions[B];
-      If[k == 0, Return @ Thread[vars -> ConstantArray[0, n]]];
-
-      (* Stable parameters as Indexed[headSym,{i}] (renders as Subscript[headSym,i]) *)
-      tsyms = Array[Indexed[headSym, {#}] &, k];
-
-      sol = Simplify[B . tsyms, asm];                        (* length n *)
-      Thread[vars -> sol]
-    ]
-  ];
-
-  (* Build, solve, assemble *)
-  built = buildA[eqns];
-  A2    = built["A"];
-
-  Nul = NullSpace[
-          A2,
-          Method   -> "OneStepRowReduction",
-          ZeroTest -> (PossibleZeroQ @ Simplify[#, asm] &)
-        ];
-
-  rules  = nullBasisRules[Nul];
-  denoms = If[Nul === {}, {}, DeleteCases[Union @ Flatten @ Denominator[Normal /@ Nul], 1] // Factor];
-  badSet = (Equal[#, 0] & /@ denoms);
-
-  <|
-    "Status" -> If[Nul === {}, "OnlyTrivialSolution", "ParametricSolution"],
-    "Nullity" -> Length[Nul],
-    "SolutionRules" -> rules,
-    "NullSpaceBasis" -> (Normal /@ Nul),
-    "ParameterConstraints" -> built["ParamConstraints"],
-    "DegeneracyConditions" -> badSet,
-    "Diagnostics" -> <|
-      "RowCount" -> built["Rows"], "ColCount" -> built["Cols"],
-      "DroppedDuplicateRows" -> built["Dropped"], "UsedDedup" -> dedupQ
-    |>
-  |>
-];
-
-Protect[SolveLargeHomogeneousLinearSystem];
-
+  debugPrint[dbg, "Sampling ", Length@samples, " parameter sets."];
+  basisMat =
+    If[TrueQ@blockDecomp,
+      blocks = variableBlocksFromMatrix[A, "Debug" -> dbg];
+      debugPrint[dbg, "Solving per-block with ", Length@blocks, " blocks..."];
+      solveNullspacePerBlock[A, blocks, "Samples" -> samples, "Debug" -> dbg, "Parallel" -> par, "MaxKernels" -> maxk],
+      If[samples === {}, Transpose@NullSpace@Normal@A, intersectNullSpacesIter[A, samples, "Debug" -> dbg]]
+    ];
+  dim = If[MatrixQ[basisMat], Last@Dimensions@basisMat, 0];
+  debugPrint[dbg, Style[Row[{"Final nullity: ", dim}], Darker@Green]];
+  debugPrint[dbg, "======== SolveLargeHomogeneousLinearSystem END =========="];
+  Which[
+    ret === "Association",
+      <|"Vars" -> vars, "MatrixDimensions" -> Dimensions@A, "Nonzeros" -> With[{p=A["NonzeroPositions"]}, If[ListQ[p], Length@p, 0]], "Nullity" -> dim, "BasisMatrix" -> basisMat|>,
+    ret === "Rules",
+      (rhsVec = If[dim==0, ConstantArray[0, Length@vars], basisMat . Table[Indexed[freeSym,{i}], {i, dim}]];
+       Thread[vars -> rhsVec]),
+    True,
+      If[MatrixQ[basisMat], Transpose@basisMat, {}]  (* list of basis vectors *)
+  ]
+]
 
 
 (* ==== SafeCoefficientRules (robust, with negative-power toggle) ==== *)
