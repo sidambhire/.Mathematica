@@ -13,6 +13,9 @@ SafeCoefficientRules::usage =
 Options: \"Assumptions\" (default True), \"TimeConstraint\" (default 2), \
 \"OnNonPolynomial\"->\"Drop\"|\"Keep\"|\"Error\" (default \"Drop\").";
 
+SafeCoefficientRulesFast::usage =
+  "SafeCoefficientRules[expr, vars] returns rules {expVector->coeff,...} for additive terms in expr w.r.t. vars.";
+
 
 Options[SolveLargeHomogeneousLinearSystem] = {
   "Parameters"      -> {},
@@ -258,6 +261,10 @@ SafeCoefficientRules[expr_, vars_List, opts:OptionsPattern[]] := Module[
 
 
 Protect[SafeCoefficientRules];
+
+SafeCoefficientRulesFast[expr_, vars_List] := Module[{terms, rules},(*Step 1:Expand expression into additive terms*) terms = List @@ Expand[expr]; (*Step 2:For each term, compute exponent vector and symbolic coefficient*) rules = Table[ Module[{term = t, exponents, monomial, coeff},(*Get integer exponents for each variable*) exponents = Table[Exponent[term, v], {v, vars}]; (*Reconstruct monomial*) monomial = Times @@ MapThread[Power, {vars, exponents}]; (*Divide to get symbolic coefficient*) coeff = Simplify[term/monomial]; exponents -> coeff], {t, terms}]; Merge[rules, Total] // Normal]
+
+Protect[SafeCoefficientRulesFast];
 
 End[];  (* `Private` *)
 EndPackage[];
